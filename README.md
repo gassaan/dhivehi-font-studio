@@ -26,7 +26,9 @@ Every push to `main` builds and deploys to GitHub Pages (`.github/workflows/depl
   - **Nib**: a flat calligraphy nib at an adjustable angle.
   - **Eraser**.
 
-  There is also a straight-line mode (hold Shift to snap to 15°), stylus pressure, a "steady hand" stabilizer, a live brush preview, undo/redo and keyboard shortcuts.
+  There is also a straight-line mode (hold Shift to snap to 15°), stylus pressure, a live brush preview, undo/redo and keyboard shortcuts.
+- **Steady hand**: presets (Off, Light, Strong, Extra steady) and two methods. *Smooth follow* lets the line trail your hand, then catch up when you let go. *Pull string* only moves the pen when you pull it by a string, so shake never reaches the line. *Smooth after drawing* tidies each finished stroke.
+- **Fine work**: zoom to 600% (Ctrl + scroll, `+` / `−`, Space + drag to pan), pens down to a 2-unit hairline on a fine-grained size slider, a grid, a brush-size cursor, an **Outline detail** setting (Standard / Fine / Extra fine), and **Show font outline**, which overlays the exact outline that goes into the font.
 - **Trace a photo** of handwriting: dark pixels become ink that can be moved, scaled and tidied with the eraser.
 - **Draw fili in context** against their own ބ. Fili are placed automatically on every letter with OpenType mark positioning, so they sit correctly in Word, browsers, phones and design apps.
 - **Test** with the built-in phonetic keyboard (h → ހ, a → ަ …), sample texts and a size waterfall, and see which letters are still missing.

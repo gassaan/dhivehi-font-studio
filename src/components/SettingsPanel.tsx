@@ -1,9 +1,9 @@
 import { go } from '../App.tsx'
 import { deleteProject } from '../lib/db.ts'
-import type { FontSettings, Project } from '../lib/types.ts'
+import { DETAIL_LEVELS, type FontSettings, type Project } from '../lib/types.ts'
 import type { Update } from './Workspace.tsx'
 
-const SLIDERS: { key: keyof FontSettings; label: string; hint: string; min: number; max: number; step: number }[] = [
+const SLIDERS: { key: Exclude<keyof FontSettings, 'detail'>; label: string; hint: string; min: number; max: number; step: number }[] = [
   { key: 'letterHeight', label: 'Letter height', hint: 'Where the letter-height guide sits. Fili are placed above this line (or above taller letters).', min: 250, max: 650, step: 5 },
   { key: 'sideBearing', label: 'Letter spacing', hint: 'Space added either side of every letter.', min: 0, max: 200, step: 1 },
   { key: 'spaceWidth', label: 'Word spacing', hint: 'Width of the space between words.', min: 80, max: 600, step: 5 },
@@ -16,6 +16,16 @@ export default function SettingsPanel({ project, update }: { project: Project; u
     <div className="two">
       <div className="card panel stack">
         <h3>Font settings</h3>
+        <div>
+          <div className="slider-row"><span>Outline detail</span></div>
+          <div className="seg" role="group" aria-label="Outline detail">
+            {DETAIL_LEVELS.map((d) => (
+              <button key={d.value} className={s.detail === d.value ? 'on' : ''} aria-pressed={s.detail === d.value}
+                onClick={() => update((p) => ({ ...p, settings: { ...p.settings, detail: d.value } }))}>{d.label}</button>
+            ))}
+          </div>
+          <div className="muted small">How closely the font follows your drawing. Extra fine keeps hairlines and small details, and makes the font file a little bigger.</div>
+        </div>
         {SLIDERS.map((f) => (
           <div key={f.key}>
             <div className="slider-row"><span>{f.label}</span><b>{f.key === 'smoothing' ? Math.round(s[f.key] * 100) + '%' : s[f.key]}</b></div>

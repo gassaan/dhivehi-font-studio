@@ -60,7 +60,15 @@ export interface FontSettings {
   spaceWidth: number
   /** How smoothly outlines are traced: 0 crisp ... 1 very smooth. */
   smoothing: number
+  /** Tracing resolution in pixels per font unit: higher keeps finer detail. */
+  detail: number
 }
+
+export const DETAIL_LEVELS = [
+  { value: 0.8, label: 'Standard' },
+  { value: 1.6, label: 'Fine' },
+  { value: 2.6, label: 'Extra fine' },
+]
 
 export interface Project {
   id: string
@@ -79,6 +87,7 @@ export const DEFAULT_SETTINGS: FontSettings = {
   sideBearing: 40,
   spaceWidth: 260,
   smoothing: 0.5,
+  detail: 0.8,
 }
 
 export function emptyGlyph(): GlyphData {

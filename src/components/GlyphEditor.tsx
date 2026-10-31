@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { CHARS, CHAR_BY_CP, GUIDE_BASE_CP, displayChar, isMark } from '../lib/charset.ts'
 import { traceGlyph } from '../lib/compile.ts'
-import { BRUSHES, finishStroke, resampleLine, snapAngle, speedTarget, taperAt, taperLength } from '../lib/brushes.ts'
+import { BRUSHES, STEADY_PRESETS, finishStroke, resampleLine, sizeToSlider, sliderToSize, smoothStroke, snapAngle, speedTarget, taperAt, taperLength, type Steady } from '../lib/brushes.ts'
 import { drawGlyph, drawSegment, drawStroke, imageToMask, preloadGlyph, type View } from '../lib/ink.ts'
-import { FRAME, FRAME_H, FRAME_W, emptyGlyph, hasInk, type GlyphData, type Project, type Stroke, type Tool } from '../lib/types.ts'
+import { DETAIL_LEVELS, FRAME, FRAME_H, FRAME_W, emptyGlyph, hasInk, type GlyphData, type Project, type Stroke, type Tool } from '../lib/types.ts'
 import { Icons, cssVar } from './ui.tsx'
+import type { Contour } from '../lib/trace.ts'
 import type { Compiled, Update } from './Workspace.tsx'
 
 type Mode = Tool | 'move'
@@ -21,7 +22,13 @@ interface Props {
 const REF_FONT = '"Noto Sans Thaana", "MV Boli", sans-serif'
 const prefKey = 'dvfs-pen'
 
-const PREF_DEFAULTS = { size: 60, angle: 35, stabilizer: 0.35, taper: 0.5, straight: false, mode: 'brush' as Mode }
+const PREF_DEFAULTS = {
+  size: 60, angle: 35, taper: 0.5, straight: false, mode: 'brush' as Mode,
+  steady: { method: 'follow', follow: 0.35, string: 50, after: 0.15 } as Steady,
+  grid: false, outline: false,
+}
+const ZOOMS = [1, 1.5, 2, 3, 4, 6]
+const MAX_CANVAS = 6000 // canvas pixels on the long side; keeps zoomed canvases light
 
 function loadPrefs() {
   try {
@@ -41,7 +48,10 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
   const [mode, setMode] = useState<Mode>(prefs.current.mode === 'move' ? 'brush' : prefs.current.mode)
   const [size, setSize] = useState<number>(prefs.current.size)
   const [angle, setAngle] = useState<number>(prefs.current.angle)
-  const [stabilizer, setStabilizer] = useState<number>(prefs.current.stabilizer)
+  const [steady, setSteady] = useState<Steady>({ ...PREF_DEFAULTS.steady, ...prefs.current.steady })
+  const [showGrid, setShowGrid] = useState<boolean>(prefs.current.grid)
+  const [showOutline, setShowOutline] = useState<boolean>(prefs.current.outline)
+  const [zoom, setZoom] = useState(1)
   const [taper, setTaper] = useState<number>(prefs.current.taper)
   const [straight, setStraight] = useState<boolean>(prefs.current.straight)
   const [showRef, setShowRef] = useState(true)
@@ -50,12 +60,14 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
   const sourceFile = useRef<File | null>(null)
 
   useEffect(() => {
-    try { localStorage.setItem(prefKey, JSON.stringify({ size, angle, stabilizer, taper, straight, mode })) } catch { /* private mode */ }
-  }, [size, angle, stabilizer, taper, straight, mode])
+    try { localStorage.setItem(prefKey, JSON.stringify({ size, angle, steady, taper, straight, mode, grid: showGrid, outline: showOutline })) } catch { /* private mode */ }
+  }, [size, angle, steady, taper, straight, mode, showGrid, showOutline])
 
   const stageRef = useRef<HTMLDivElement>(null)
   const bgRef = useRef<HTMLCanvasElement>(null)
   const inkRef = useRef<HTMLCanvasElement>(null)
+  const outlineRef = useRef<HTMLCanvasElement>(null)
+  const cursorRef = useRef<HTMLCanvasElement>(null)
   const [box, setBox] = useState({ w: 400, h: 480 })
   const dpr = Math.min(2, window.devicePixelRatio || 1)
 
@@ -75,7 +87,48 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
     return () => ro.disconnect()
   }, [])
 
-  const view: View = { x0: FRAME.left, y0: FRAME.top, scale: (box.h * dpr) / FRAME_H }
+  // Zoomed paper size (CSS px) and canvas pixels per CSS px, capped for memory.
+  const paperW = Math.round(box.w * zoom), paperH = Math.round(box.h * zoom)
+  const pxr = Math.min(dpr, MAX_CANVAS / paperH)
+  const canvasW = Math.round(paperW * pxr), canvasH = Math.round(paperH * pxr)
+  const view: View = { x0: FRAME.left, y0: FRAME.top, scale: canvasH / FRAME_H }
+
+  // Keep the same spot in the middle of the screen when zooming.
+  const zoomCenter = useRef<{ fx: number; fy: number } | null>(null)
+  const setZoomKeep = useCallback((z: number) => {
+    const st = stageRef.current
+    if (st) {
+      zoomCenter.current = {
+        fx: (st.scrollLeft + st.clientWidth / 2) / Math.max(1, st.scrollWidth),
+        fy: (st.scrollTop + st.clientHeight / 2) / Math.max(1, st.scrollHeight),
+      }
+    }
+    setZoom(Math.max(ZOOMS[0], Math.min(ZOOMS[ZOOMS.length - 1], z)))
+  }, [])
+  useLayoutEffect(() => {
+    const st = stageRef.current, c = zoomCenter.current
+    if (!st || !c) return
+    zoomCenter.current = null
+    st.scrollLeft = c.fx * st.scrollWidth - st.clientWidth / 2
+    st.scrollTop = c.fy * st.scrollHeight - st.clientHeight / 2
+  }, [zoom])
+  const zoomStep = useCallback((dir: 1 | -1) => {
+    const i = ZOOMS.findIndex((z) => z >= zoom - 0.01)
+    setZoomKeep(ZOOMS[Math.max(0, Math.min(ZOOMS.length - 1, i + dir))])
+  }, [zoom, setZoomKeep])
+
+  // Ctrl/⌘ + scroll wheel (or trackpad pinch) zooms.
+  useEffect(() => {
+    const st = stageRef.current
+    if (!st) return
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return
+      e.preventDefault()
+      setZoomKeep(zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12))
+    }
+    st.addEventListener('wheel', onWheel, { passive: false })
+    return () => st.removeEventListener('wheel', onWheel)
+  }, [zoom, setZoomKeep])
   const toUnits = (e: { clientX: number; clientY: number }) => {
     const r = inkRef.current!.getBoundingClientRect()
     return {
@@ -113,8 +166,8 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
   const [guideCenter, setGuideCenter] = useState<number | null>(null)
   useEffect(() => {
     if (!mark || !hasInk(guide)) { setGuideCenter(null); return }
-    traceGlyph(guide!, settings.smoothing, String(GUIDE_BASE_CP)).then((t) => setGuideCenter(t ? (t.xMin + t.xMax) / 2 : null))
-  }, [mark, guide, settings.smoothing])
+    traceGlyph(guide!, settings.smoothing, String(GUIDE_BASE_CP), settings.detail).then((t) => setGuideCenter(t ? (t.xMin + t.xMax) / 2 : null))
+  }, [mark, guide, settings.smoothing, settings.detail])
 
   useEffect(() => {
     let live = true
@@ -176,7 +229,7 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
           c2.fillText('ބ' + info.char, x, Y(0))
           c2.globalCompositeOperation = 'destination-out'
           c2.fillText('ބ', x, Y(0))
-          c2.lineWidth = 3 * dpr // also remove the anti-aliased fringe
+          c2.lineWidth = 3 * pxr // also remove the anti-aliased fringe
           c2.strokeText('ބ', x, Y(0))
           ctx.globalAlpha = 0.3
           ctx.drawImage(t2, 0, 0)
@@ -187,34 +240,51 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
         }
       }
 
+      // Grid: every 50 units (25 when zoomed in), stronger every 100.
+      if (showGrid) {
+        const stepU = zoom >= 2 ? 25 : 50
+        ctx.strokeStyle = cssVar('--guide')
+        ctx.lineWidth = 1 * pxr
+        for (let u = Math.ceil(FRAME.bottom / stepU) * stepU; u <= FRAME.top; u += stepU) {
+          ctx.globalAlpha = u % 100 === 0 ? 0.16 : 0.07
+          ctx.beginPath(); ctx.moveTo(0, Y(u)); ctx.lineTo(W, Y(u)); ctx.stroke()
+        }
+        for (let u = FRAME.left; u <= FRAME.right; u += stepU) {
+          const X = (u - view.x0) * view.scale
+          ctx.globalAlpha = u % 100 === 0 ? 0.16 : 0.07
+          ctx.beginPath(); ctx.moveTo(X, 0); ctx.lineTo(X, c.height); ctx.stroke()
+        }
+        ctx.globalAlpha = 1
+      }
+
       // Guide lines
       const line = (y: number, label: string, strong = false) => {
         ctx.strokeStyle = cssVar('--guide')
         ctx.globalAlpha = strong ? 0.7 : 0.35
-        ctx.lineWidth = strong ? 2 * dpr : 1 * dpr
-        ctx.setLineDash(strong ? [] : [6 * dpr, 6 * dpr])
+        ctx.lineWidth = strong ? 2 * pxr : 1 * pxr
+        ctx.setLineDash(strong ? [] : [6 * pxr, 6 * pxr])
         ctx.beginPath(); ctx.moveTo(0, Y(y)); ctx.lineTo(W, Y(y)); ctx.stroke()
         ctx.setLineDash([])
         ctx.globalAlpha = 0.8
         ctx.fillStyle = cssVar('--guide')
-        ctx.font = `${11 * dpr}px system-ui, sans-serif`
+        ctx.font = `${11 * pxr}px system-ui, sans-serif`
         ctx.direction = 'ltr'
         ctx.textAlign = 'left'
-        ctx.fillText(label, 8 * dpr, Y(y) - 5 * dpr)
+        ctx.fillText(label, 8 * pxr, Y(y) - 5 * pxr)
         ctx.globalAlpha = 1
       }
       line(0, 'Baseline', true)
       line(lh, 'Letter height')
       ctx.fillStyle = cssVar('--guide')
       ctx.globalAlpha = 0.55
-      ctx.font = `${11 * dpr}px system-ui, sans-serif`
-      ctx.fillText('Fili above', 8 * dpr, Y(FRAME.top) + 16 * dpr)
-      ctx.fillText('Fili below', 8 * dpr, Y(FRAME.bottom) - 8 * dpr)
+      ctx.font = `${11 * pxr}px system-ui, sans-serif`
+      ctx.fillText('Fili above', 8 * pxr, Y(FRAME.top) + 16 * pxr)
+      ctx.fillText('Fili below', 8 * pxr, Y(FRAME.bottom) - 8 * pxr)
       ctx.globalAlpha = 1
     }
     draw()
     return () => { live = false }
-  }, [box, dpr, showRef, mark, info.char, guide, guideCenter, settings.letterHeight]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [canvasW, canvasH, pxr, zoom, showGrid, showRef, mark, info.char, guide, guideCenter, settings.letterHeight]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------- Ink layer ----------
   const redrawInk = useCallback(async (g: GlyphData) => {
@@ -226,7 +296,32 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
     drawGlyph(ctx, g, { x0: FRAME.left, y0: FRAME.top, scale: c.height / FRAME_H }, cssVar('--ink'))
   }, [])
 
-  useEffect(() => { redrawInk(glyph) }, [glyph, box, redrawInk])
+  useEffect(() => { redrawInk(glyph) }, [glyph, canvasW, canvasH, redrawInk])
+
+  // ---------- Font outline overlay: exactly what goes into the font ----------
+  const [outline, setOutline] = useState<Contour[] | null>(null)
+  useEffect(() => {
+    if (!showOutline || !hasInk(glyph)) { setOutline(null); return }
+    let live = true
+    traceGlyph(glyph, settings.smoothing, String(cp), settings.detail).then((t) => live && setOutline(t?.contours ?? null))
+    return () => { live = false }
+  }, [showOutline, glyph, cp, settings.smoothing, settings.detail])
+  useEffect(() => {
+    const c = outlineRef.current
+    if (!c) return
+    const ctx = c.getContext('2d')!
+    ctx.clearRect(0, 0, c.width, c.height)
+    if (!outline) return
+    const X = (x: number) => (x - view.x0) * view.scale, Y = (y: number) => (view.y0 - y) * view.scale
+    ctx.strokeStyle = cssVar('--coral')
+    ctx.lineWidth = 1.5 * pxr
+    ctx.beginPath()
+    for (const con of outline) drawContour(ctx, con, X, Y)
+    ctx.stroke()
+    // On-curve corner points.
+    ctx.fillStyle = cssVar('--coral')
+    for (const con of outline) for (const p of con) if (p.on) ctx.fillRect(X(p.x) - 2 * pxr, Y(p.y) - 2 * pxr, 4 * pxr, 4 * pxr)
+  }, [outline, canvasW, canvasH, pxr]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------- Pointer drawing ----------
   interface Live {
@@ -245,7 +340,101 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
   const penOf = (ev: PointerEvent | React.PointerEvent) => (ev.pointerType === 'pen' ? Math.max(0.05, ev.pressure) : 1)
   const r1 = (n: number) => Math.round(n * 10) / 10
 
+  // Smallest distance between recorded points: finer for thin pens.
+  const minStep = Math.max(0.4, Math.min(2, size * 0.05))
+
+  // Brush cursor, and the pull-string while drawing.
+  const drawCursor = (pointer: { x: number; y: number } | null, pen?: { x: number; y: number }) => {
+    const c = cursorRef.current
+    if (!c) return
+    const ctx = c.getContext('2d')!
+    ctx.clearRect(0, 0, c.width, c.height)
+    if (!pointer || mode === 'move' || panning.current) return
+    const X = (x: number) => (x - view.x0) * view.scale, Y = (y: number) => (view.y0 - y) * view.scale
+    const at = pen ?? pointer
+    ctx.lineWidth = 1 * pxr
+    ctx.strokeStyle = cssVar('--accent')
+    ctx.globalAlpha = 0.8
+    const r = Math.max(1.5 * pxr, (size / 2) * view.scale)
+    ctx.beginPath()
+    if (mode === 'marker') ctx.rect(X(at.x) - r, Y(at.y) - r, r * 2, r * 2)
+    else if (mode === 'nib') {
+      const a = (angle * Math.PI) / 180
+      ctx.moveTo(X(at.x) - Math.cos(a) * r, Y(at.y) + Math.sin(a) * r)
+      ctx.lineTo(X(at.x) + Math.cos(a) * r, Y(at.y) - Math.sin(a) * r)
+    } else ctx.arc(X(at.x), Y(at.y), r, 0, Math.PI * 2)
+    ctx.stroke()
+    if (pen && steady.method === 'string' && steady.string > 0) {
+      ctx.setLineDash([4 * pxr, 4 * pxr])
+      ctx.globalAlpha = 0.45
+      ctx.beginPath()
+      ctx.arc(X(at.x), Y(at.y), steady.string * view.scale, 0, Math.PI * 2)
+      ctx.stroke()
+      ctx.setLineDash([])
+      ctx.globalAlpha = 0.9
+      ctx.beginPath()
+      ctx.moveTo(X(at.x), Y(at.y))
+      ctx.lineTo(X(pointer.x), Y(pointer.y))
+      ctx.stroke()
+    }
+    ctx.globalAlpha = 1
+  }
+
+  // Space + drag pans the zoomed page.
+  const spaceDown = useRef(false)
+  const panning = useRef<{ x: number; y: number; sl: number; st: number } | null>(null)
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => {
+      if (e.code === 'Space' && (e.target as HTMLElement)?.tagName !== 'INPUT') { spaceDown.current = true; e.preventDefault() }
+    }
+    const up = (e: KeyboardEvent) => { if (e.code === 'Space') spaceDown.current = false }
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up) }
+  }, [])
+
+  /** Moves the steadied pen toward the pointer according to the chosen method. */
+  const steer = (l: Live, p: { x: number; y: number }) => {
+    if (steady.method === 'string') {
+      const dx = p.x - l.sx, dy = p.y - l.sy
+      const d = Math.hypot(dx, dy)
+      const L = steady.string
+      if (d > L) { l.sx += (dx * (d - L)) / d; l.sy += (dy * (d - L)) / d }
+    } else {
+      const k = 1 - Math.min(0.97, steady.follow)
+      l.sx += (p.x - l.sx) * k
+      l.sy += (p.y - l.sy) * k
+    }
+  }
+
+  /** Adds the current steadied position as a point (if far enough from the last one). */
+  const addPoint = (l: Live, pen: number, time: number, ctx: CanvasRenderingContext2D, v: View) => {
+    const pts = l.stroke.pts
+    const lx = pts[pts.length - 3], ly = pts[pts.length - 2]
+    const step = Math.hypot(l.sx - lx, l.sy - ly)
+    if (step < minStep) return
+    l.dist += step
+    let w = pen
+    if (mode === 'taper' && taper > 0) w = taperAt(l.dist, taperLength(size, taper)) * pen
+    if (mode === 'speed') {
+      const dt = Math.max(1, time - l.t)
+      l.speedK += (speedTarget(step / dt) - l.speedK) * 0.25
+      w = l.speedK * pen
+    }
+    l.t = time
+    pts.push(r1(l.sx), r1(l.sy), Math.round(w * 1000) / 1000)
+    l.pens.push(pen)
+    drawSegment(ctx, l.stroke, pts.length / 3 - 1, v, cssVar('--ink'))
+  }
+
   const onDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.button === 1 || (e.button === 0 && spaceDown.current)) {
+      const st = stageRef.current!
+      panning.current = { x: e.clientX, y: e.clientY, sl: st.scrollLeft, st: st.scrollTop }
+      e.currentTarget.setPointerCapture(e.pointerId)
+      drawCursor(null)
+      return
+    }
     if (e.button !== 0) return
     e.currentTarget.setPointerCapture(e.pointerId)
     const p = toUnits(e)
@@ -254,13 +443,20 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
       return
     }
     const pen = penOf(e)
-    const first = mode === 'taper' ? taperAt(0, taperLength(size, taper)) * pen : mode === 'speed' ? 0.7 * pen : pen
-    const stroke: Stroke = { tool: mode, size, angle, pts: [r1(p.x), r1(p.y), taper > 0 || mode !== 'taper' ? first : pen] }
+    const first = mode === 'taper' && taper > 0 ? taperAt(0, taperLength(size, taper)) * pen : mode === 'speed' ? 0.7 * pen : pen
+    const stroke: Stroke = { tool: mode, size, angle, pts: [r1(p.x), r1(p.y), first] }
     live.current = { stroke, pens: [pen], sx: p.x, sy: p.y, dist: 0, t: e.timeStamp, speedK: 0.7, straight: straight || e.shiftKey }
     drawSegment(inkRef.current!.getContext('2d')!, stroke, 0, inkView(), cssVar('--ink'))
+    drawCursor(p, p)
   }
 
   const onMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (panning.current) {
+      const st = stageRef.current!, pn = panning.current
+      st.scrollLeft = pn.sl - (e.clientX - pn.x)
+      st.scrollTop = pn.st - (e.clientY - pn.y)
+      return
+    }
     if (dragImg.current && glyph.image) {
       const p = toUnits(e)
       const d = dragImg.current
@@ -269,7 +465,7 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
       return
     }
     const l = live.current
-    if (!l) return
+    if (!l) { drawCursor(toUnits(e)); return }
     const ctx = inkRef.current!.getContext('2d')!
     const v = inkView()
 
@@ -286,37 +482,22 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
       ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height)
       drawGlyph(ctx, glyph, v, cssVar('--ink'))
       drawStroke(ctx, shown, v, cssVar('--ink'))
+      drawCursor({ x: x1, y: y1 })
       return
     }
 
     const events = e.nativeEvent.getCoalescedEvents?.() ?? [e.nativeEvent]
+    let last = toUnits(e)
     for (const ev of events) {
-      const p = toUnits(ev)
-      // Stabilizer: the pen trails the pointer a little, smoothing out jitter.
-      const k = 1 - stabilizer * 0.85
-      l.sx += (p.x - l.sx) * k
-      l.sy += (p.y - l.sy) * k
-      const pts = l.stroke.pts
-      const lx = pts[pts.length - 3], ly = pts[pts.length - 2]
-      const step = Math.hypot(l.sx - lx, l.sy - ly)
-      if (step < 2) continue
-      const pen = penOf(ev)
-      l.dist += step
-      let w = pen
-      if (mode === 'taper' && taper > 0) w = taperAt(l.dist, taperLength(size, taper)) * pen
-      if (mode === 'speed') {
-        const dt = Math.max(1, ev.timeStamp - l.t)
-        l.speedK += (speedTarget(step / dt) - l.speedK) * 0.25
-        w = l.speedK * pen
-      }
-      l.t = ev.timeStamp
-      pts.push(r1(l.sx), r1(l.sy), Math.round(w * 1000) / 1000)
-      l.pens.push(pen)
-      drawSegment(ctx, l.stroke, pts.length / 3 - 1, v, cssVar('--ink'))
+      last = toUnits(ev)
+      steer(l, last)
+      addPoint(l, penOf(ev), ev.timeStamp, ctx, v)
     }
+    drawCursor(last, { x: l.sx, y: l.sy })
   }
 
   const onUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (panning.current) { panning.current = null; return }
     if (dragImg.current && glyph.image) {
       const p = toUnits(e)
       const d = dragImg.current
@@ -326,12 +507,27 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
     }
     const l = live.current
     live.current = null
+    drawCursor(toUnits(e))
     if (!l) return
     let stroke = l.stroke
     let pens = l.pens
     if (l.straight) {
       stroke = resampleLine(stroke, l.pens[0])
       pens = []
+    } else {
+      // Smooth follow lags behind the pointer: let the line catch up to where you let go.
+      if (steady.method === 'follow' && steady.follow > 0 && e.type === 'pointerup') {
+        const end = toUnits(e)
+        const ctx = inkRef.current!.getContext('2d')!
+        for (let i = 0; i < 12; i++) { l.sx += (end.x - l.sx) * 0.5; l.sy += (end.y - l.sy) * 0.5; addPoint(l, l.pens[l.pens.length - 1] ?? 1, e.timeStamp, ctx, inkView()) }
+        stroke = l.stroke
+        pens = l.pens
+      }
+      if (steady.after > 0) {
+        const sm = smoothStroke(stroke.pts, pens, steady.after)
+        stroke = { ...stroke, pts: sm.pts }
+        pens = sm.pens
+      }
     }
     commit({ ...glyph, strokes: [...glyph.strokes, finishStroke(stroke, taper, pens)] })
   }
@@ -377,12 +573,17 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
       else if (e.key === 'ArrowLeft') onNavigate(prev.cp)
       else if (e.key === 'l') setStraight((v) => !v)
       else if (!mod && BRUSHES.some((b) => b.key === e.key)) setMode(BRUSHES.find((b) => b.key === e.key)!.id)
-      else if (e.key === '[') setSize((s) => Math.max(8, s - 6))
-      else if (e.key === ']') setSize((s) => Math.min(200, s + 6))
+      else if (e.key === '[') setSize((s) => sliderToSize(Math.max(0, sizeToSlider(s) - 4)))
+      else if (e.key === ']') setSize((s) => sliderToSize(Math.min(100, sizeToSlider(s) + 4)))
+      else if (e.key === '+' || e.key === '=') zoomStep(1)
+      else if (e.key === '-') zoomStep(-1)
+      else if (e.key === '0') setZoomKeep(1)
+      else if (e.key === 'g') setShowGrid((v) => !v)
+      else if (e.key === 'o') setShowOutline((v) => !v)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [undo, redo, onClose, onNavigate, next.cp, prev.cp])
+  }, [undo, redo, onClose, onNavigate, next.cp, prev.cp, zoomStep, setZoomKeep])
 
   // Live test strip using the compiled font.
   const sample = mark
@@ -401,6 +602,11 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
           <div><b>{info.name}</b><small>U+{cp.toString(16).toUpperCase().padStart(4, '0')} · {mark ? (info.kind === 'markAbove' ? 'fili above' : 'fili below') : info.group === 'core' ? 'letter' : info.group}</small></div>
         </div>
         <span className="spacer" />
+        <div className="zoombar" role="group" aria-label="Zoom">
+          <button className="btn small" onClick={() => zoomStep(-1)} disabled={zoom <= ZOOMS[0]} title="Zoom out (−)">−</button>
+          <button className="btn small zoom-label" onClick={() => setZoomKeep(1)} title="Fit to screen (0)">{Math.round(zoom * 100)}%</button>
+          <button className="btn small" onClick={() => zoomStep(1)} disabled={zoom >= ZOOMS[ZOOMS.length - 1]} title="Zoom in (+)">+</button>
+        </div>
         <button className="btn small" onClick={undo} disabled={!history.past.length} title="Undo (Ctrl+Z)">{Icons.undo}</button>
         <button className="btn small" onClick={redo} disabled={!history.future.length} title="Redo (Ctrl+Shift+Z)">{Icons.redo}</button>
         <button className="btn small" onClick={() => onNavigate(prev.cp)} title="Previous (←)">{Icons.left}<span className="thaana">{displayChar(prev)}</span></button>
@@ -424,8 +630,19 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
           </div>
           {mode !== 'move' && <BrushPreview tool={mode} size={size} angle={angle} taper={taper} straight={straight} />}
           <div>
-            <div className="slider-row"><span>Size</span><b>{size}</b></div>
-            <input type="range" min={8} max={200} value={size} onChange={(e) => setSize(+e.target.value)} aria-label="Pen size" />
+            <div className="slider-row"><span>Size</span>
+              <input className="num" type="number" min={2} max={240} step={0.5} value={size} aria-label="Pen size in font units"
+                onChange={(e) => { const v = parseFloat(e.target.value); if (v >= 2 && v <= 240) setSize(v) }} />
+            </div>
+            <input type="range" min={0} max={100} step={0.5} value={sizeToSlider(size)} onChange={(e) => setSize(sliderToSize(+e.target.value))} aria-label="Pen size" />
+            <div className="row" style={{ gap: 4, marginTop: 6 }}>
+              {[3, 8, 20, 45, 90].map((v) => (
+                <button key={v} className={`btn small chip ${size === v ? 'on' : ''}`} onClick={() => setSize(v)}>{v === 3 ? 'Hairline' : v}</button>
+              ))}
+            </div>
+            {size < 14 && settings.detail < 1.6 && (
+              <p className="muted small" style={{ margin: '6px 0 0' }}>For very thin lines, set <b>Outline detail</b> to Fine or Extra fine (right panel) so they survive into the font.</p>
+            )}
           </div>
           {mode === 'nib' && (
             <div>
@@ -443,11 +660,44 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
             <input type="checkbox" checked={straight} onChange={(e) => setStraight(e.target.checked)} />Straight lines
           </label>
           <div>
-            <div className="slider-row"><span>Steady hand</span><b>{Math.round(stabilizer * 100)}%</b></div>
-            <input type="range" min={0} max={0.9} step={0.05} value={stabilizer} onChange={(e) => setStabilizer(+e.target.value)} aria-label="Stabilizer" />
+            <h4>Steady hand</h4>
+            <div className="seg" role="group" aria-label="Steady presets">
+              {STEADY_PRESETS.map((pr) => {
+                const on = JSON.stringify(pr.steady) === JSON.stringify(steady)
+                return <button key={pr.label} className={on ? 'on' : ''} aria-pressed={on} onClick={() => setSteady(pr.steady)}>{pr.label}</button>
+              })}
+            </div>
+            <div className="seg" role="group" aria-label="Steady method" style={{ marginTop: 10 }}>
+              <button className={steady.method === 'follow' ? 'on' : ''} aria-pressed={steady.method === 'follow'}
+                onClick={() => setSteady({ ...steady, method: 'follow', follow: steady.follow || 0.5 })}>Smooth follow</button>
+              <button className={steady.method === 'string' ? 'on' : ''} aria-pressed={steady.method === 'string'}
+                onClick={() => setSteady({ ...steady, method: 'string', string: steady.string || 50 })}>Pull string</button>
+            </div>
+            <p className="muted small" style={{ margin: '6px 0 8px' }}>
+              {steady.method === 'follow'
+                ? 'The line trails your hand and evens out wobbles. Higher is smoother.'
+                : 'The pen only moves when you pull it by the string, so shaky movements never reach the line. Longer string is steadier.'}
+            </p>
+            {steady.method === 'follow' ? (
+              <>
+                <div className="slider-row"><span>Smoothness</span><b>{Math.round(steady.follow * 100)}%</b></div>
+                <input type="range" min={0} max={0.97} step={0.01} value={steady.follow} aria-label="Smooth follow strength"
+                  onChange={(e) => setSteady({ ...steady, follow: +e.target.value })} />
+              </>
+            ) : (
+              <>
+                <div className="slider-row"><span>String length</span><b>{steady.string}</b></div>
+                <input type="range" min={0} max={200} step={1} value={steady.string} aria-label="String length"
+                  onChange={(e) => setSteady({ ...steady, string: +e.target.value })} />
+              </>
+            )}
+            <div className="slider-row" style={{ marginTop: 6 }}><span>Smooth after drawing</span><b>{Math.round(steady.after * 100)}%</b></div>
+            <input type="range" min={0} max={1} step={0.05} value={steady.after} aria-label="Smooth after drawing"
+              onChange={(e) => setSteady({ ...steady, after: +e.target.value })} />
           </div>
           <div className="stack" style={{ gap: 8 }}>
             <label className="check"><input type="checkbox" checked={showRef} onChange={(e) => setShowRef(e.target.checked)} />Show reference letter</label>
+            <label className="check" title="G"><input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} />Show grid</label>
             <button className="btn small danger" disabled={!hasInk(glyph)} onClick={() => commit({ ...emptyGlyph(), lsbAdjust: glyph.lsbAdjust, rsbAdjust: glyph.rsbAdjust })}>{Icons.trash} Clear</button>
           </div>
           <div>
@@ -481,11 +731,14 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
         </aside>
 
         <div className="stage" ref={stageRef}>
-          <div className="paper" style={{ width: box.w, height: box.h }}>
-            <canvas ref={bgRef} width={box.w * dpr} height={box.h * dpr} />
-            <canvas ref={inkRef} className="ink" width={box.w * dpr} height={box.h * dpr}
+          <div className="paper" style={{ width: paperW, height: paperH }}>
+            <canvas ref={bgRef} width={canvasW} height={canvasH} />
+            <canvas ref={inkRef} width={canvasW} height={canvasH} />
+            <canvas ref={outlineRef} width={canvasW} height={canvasH} />
+            <canvas ref={cursorRef} className="ink" width={canvasW} height={canvasH}
               style={{ cursor: mode === 'move' ? 'move' : 'crosshair' }}
               onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+              onPointerLeave={() => !live.current && drawCursor(null)}
               aria-label="Drawing area" />
           </div>
         </div>
@@ -497,6 +750,23 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
               ? <div className="strip" style={{ fontFamily: `"${compiled.family}", ${REF_FONT}` }}>{sample}</div>
               : <div className="strip wait">{hasInk(glyph) ? 'Updating…' : 'Draw something and it appears here, set in your font.'}</div>}
             <p className="muted small" style={{ margin: '6px 0 0' }}>Letters you haven’t drawn yet show in a standard font.</p>
+          </div>
+          <div>
+            <h4>Outline detail</h4>
+            <div className="seg" role="group" aria-label="Outline detail">
+              {DETAIL_LEVELS.map((d) => (
+                <button key={d.value} className={settings.detail === d.value ? 'on' : ''} aria-pressed={settings.detail === d.value}
+                  onClick={() => update((p) => ({ ...p, settings: { ...p.settings, detail: d.value } }))}>{d.label}</button>
+              ))}
+            </div>
+            <p className="muted small" style={{ margin: '6px 0 8px' }}>How closely the font follows your ink. Extra fine keeps hairlines and tiny details; it applies to the whole font.</p>
+            <div className="slider-row"><span>Curve smoothing</span><b>{Math.round(settings.smoothing * 100)}%</b></div>
+            <input type="range" min={0} max={1} step={0.05} value={settings.smoothing} aria-label="Curve smoothing"
+              onChange={(e) => update((p) => ({ ...p, settings: { ...p.settings, smoothing: +e.target.value } }))} />
+            <label className="check" style={{ marginTop: 8 }} title="O">
+              <input type="checkbox" checked={showOutline} onChange={(e) => setShowOutline(e.target.checked)} />Show font outline
+            </label>
+            <p className="muted small" style={{ margin: '4px 0 0' }}>Draws the exact outline that goes into your font over your ink, with its corner points.</p>
           </div>
           {!mark && (
             <div>
@@ -516,6 +786,7 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
                 ? <><li>Draw the fili where it should sit on the faint <span className="thaana">ބ</span>. It will sit the same way on every letter.</li><li>Draw your own <span className="thaana">ބ</span> first for the best fit.</li></>
                 : <><li>Sit the letter on the baseline and keep its body near the letter-height line.</li><li>Where you draw left or right doesn’t matter; spacing is automatic.</li></>}
               <li>Shortcuts: <span className="kbd">B</span> <span className="kbd">P</span> <span className="kbd">R</span> <span className="kbd">M</span> <span className="kbd">N</span> <span className="kbd">E</span> tools, <span className="kbd">L</span> straight lines (hold <span className="kbd">Shift</span> to snap), <span className="kbd">[</span> <span className="kbd">]</span> size, <span className="kbd">←</span> <span className="kbd">→</span> letters.</li>
+              <li>Zoom with <span className="kbd">+</span> <span className="kbd">−</span> or Ctrl + scroll; <span className="kbd">0</span> fits. Hold <span className="kbd">Space</span> and drag to move around. <span className="kbd">G</span> grid, <span className="kbd">O</span> outline.</li>
             </ul>
           </div>
         </aside>
@@ -548,4 +819,29 @@ function BrushPreview({ tool, size, angle, taper, straight }: { tool: Tool; size
     drawStroke(ctx, stroke, { x0: 0, y0: 300, scale }, tool === 'eraser' ? cssVar('--muted') : cssVar('--ink'))
   }, [tool, size, angle, taper, straight])
   return <canvas ref={ref} width={376} height={113} className="brush-preview" aria-label="Brush preview" />
+}
+
+/** Traces a TrueType contour (on/off-curve points, implied midpoints) onto a canvas path. */
+function drawContour(ctx: CanvasRenderingContext2D, c: Contour, X: (x: number) => number, Y: (y: number) => number) {
+  const n = c.length
+  if (n < 2) return
+  const mid = (a: { x: number; y: number }, b: { x: number; y: number }) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 })
+  // Start on an on-curve point; if there is none, on the implied midpoint before point 0.
+  const s0 = c.findIndex((p) => p.on)
+  const first = s0 >= 0 ? c[s0] : mid(c[n - 1], c[0])
+  const order = s0 >= 0 ? Array.from({ length: n - 1 }, (_, k) => c[(s0 + 1 + k) % n]) : c
+  ctx.moveTo(X(first.x), Y(first.y))
+  let ctrl: { x: number; y: number } | null = null
+  for (const p of order) {
+    if (p.on) {
+      if (ctrl) ctx.quadraticCurveTo(X(ctrl.x), Y(ctrl.y), X(p.x), Y(p.y))
+      else ctx.lineTo(X(p.x), Y(p.y))
+      ctrl = null
+    } else {
+      if (ctrl) { const m = mid(ctrl, p); ctx.quadraticCurveTo(X(ctrl.x), Y(ctrl.y), X(m.x), Y(m.y)) }
+      ctrl = p
+    }
+  }
+  if (ctrl) ctx.quadraticCurveTo(X(ctrl.x), Y(ctrl.y), X(first.x), Y(first.y))
+  ctx.closePath()
 }

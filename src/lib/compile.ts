@@ -4,7 +4,6 @@ import { traceBitmap, type Contour } from './trace.ts'
 import { buildTTF, type Anchor, type MarkClassData, type SfntGlyph } from './sfnt.ts'
 import { ASCENDER, DESCENDER, FRAME, UPM, hasInk, type GlyphData, type Project } from './types.ts'
 
-const RASTER_SCALE = 0.8 // pixels per font unit when tracing
 
 interface Traced {
   contours: Contour[]
@@ -39,8 +38,9 @@ function inkBounds(g: GlyphData) {
 }
 
 /** Rasterises a glyph's ink and traces it into outlines in font units. */
-export async function traceGlyph(g: GlyphData, smoothing: number, key?: string): Promise<Traced | null> {
-  const cacheKey = key ? `${key}:${g.updatedAt}:${smoothing}` : ''
+export async function traceGlyph(g: GlyphData, smoothing: number, key?: string, detail = 0.8): Promise<Traced | null> {
+  const RASTER_SCALE = Math.max(0.4, Math.min(4, detail)) // pixels per font unit
+  const cacheKey = key ? `${key}:${g.updatedAt}:${smoothing}:${RASTER_SCALE}` : ''
   if (cacheKey && cache.has(cacheKey)) return cache.get(cacheKey)!
   if (!hasInk(g)) return null
   await preloadGlyph(g)
@@ -104,7 +104,7 @@ export async function compileProject(p: Project): Promise<CompileResult> {
 
   // Where fili were drawn relative to: the designer's own baa, if any.
   const guide = p.glyphs[GUIDE_BASE_CP]
-  const guideT = guide ? await traceGlyph(guide, s.smoothing, String(GUIDE_BASE_CP)) : null
+  const guideT = guide ? await traceGlyph(guide, s.smoothing, String(GUIDE_BASE_CP), s.detail) : null
   const markTopY = Math.max(s.letterHeight, guideT?.yMax ?? s.letterHeight)
   const markBottomY = Math.min(0, guideT?.yMin ?? 0)
   const frameCenter = (FRAME.left + FRAME.right) / 2
@@ -112,7 +112,7 @@ export async function compileProject(p: Project): Promise<CompileResult> {
   for (const c of CHARS) {
     const g = p.glyphs[c.cp]
     if (!g || !hasInk(g)) continue
-    const t = await traceGlyph(g, s.smoothing, String(c.cp))
+    const t = await traceGlyph(g, s.smoothing, String(c.cp), s.detail)
     if (!t) continue
     drawn.add(c.cp)
     const gid = glyphs.length
