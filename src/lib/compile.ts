@@ -24,7 +24,7 @@ function inkBounds(g: GlyphData) {
   }
   for (const s of g.strokes) {
     if (s.tool === 'eraser') continue
-    for (let i = 0; i < s.pts.length; i += 3) add(s.pts[i], s.pts[i + 1], s.size / 2 + 4)
+    for (let i = 0; i < s.pts.length; i += 3) add(s.pts[i], s.pts[i + 1], s.size * 0.75 + 4) // marker corners reach size/√2
   }
   if (g.image) {
     add(g.image.x, g.image.y, 0)

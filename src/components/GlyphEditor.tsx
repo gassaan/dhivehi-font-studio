@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { CHARS, CHAR_BY_CP, GUIDE_BASE_CP, displayChar, isMark } from '../lib/charset.ts'
 import { traceGlyph } from '../lib/compile.ts'
-import { drawGlyph, drawSegment, imageToMask, preloadGlyph, type View } from '../lib/ink.ts'
+import { BRUSHES, finishStroke, resampleLine, snapAngle, speedTarget, taperAt, taperLength } from '../lib/brushes.ts'
+import { drawGlyph, drawSegment, drawStroke, imageToMask, preloadGlyph, type View } from '../lib/ink.ts'
 import { FRAME, FRAME_H, FRAME_W, emptyGlyph, hasInk, type GlyphData, type Project, type Stroke, type Tool } from '../lib/types.ts'
 import { Icons, cssVar } from './ui.tsx'
 import type { Compiled, Update } from './Workspace.tsx'
@@ -20,11 +21,13 @@ interface Props {
 const REF_FONT = '"Noto Sans Thaana", "MV Boli", sans-serif'
 const prefKey = 'dvfs-pen'
 
+const PREF_DEFAULTS = { size: 60, angle: 35, stabilizer: 0.35, taper: 0.5, straight: false, mode: 'brush' as Mode }
+
 function loadPrefs() {
   try {
-    return { size: 60, angle: 35, stabilizer: 0.35, mode: 'brush' as Mode, ...JSON.parse(localStorage.getItem(prefKey) || '{}') }
+    return { ...PREF_DEFAULTS, ...JSON.parse(localStorage.getItem(prefKey) || '{}') }
   } catch {
-    return { size: 60, angle: 35, stabilizer: 0.35, mode: 'brush' as Mode }
+    return { ...PREF_DEFAULTS }
   }
 }
 
@@ -39,14 +42,16 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
   const [size, setSize] = useState<number>(prefs.current.size)
   const [angle, setAngle] = useState<number>(prefs.current.angle)
   const [stabilizer, setStabilizer] = useState<number>(prefs.current.stabilizer)
+  const [taper, setTaper] = useState<number>(prefs.current.taper)
+  const [straight, setStraight] = useState<boolean>(prefs.current.straight)
   const [showRef, setShowRef] = useState(true)
   const [history, setHistory] = useState<{ past: GlyphData[]; future: GlyphData[] }>({ past: [], future: [] })
   const [threshold, setThreshold] = useState(0.5)
   const sourceFile = useRef<File | null>(null)
 
   useEffect(() => {
-    try { localStorage.setItem(prefKey, JSON.stringify({ size, angle, stabilizer, mode })) } catch { /* private mode */ }
-  }, [size, angle, stabilizer, mode])
+    try { localStorage.setItem(prefKey, JSON.stringify({ size, angle, stabilizer, taper, straight, mode })) } catch { /* private mode */ }
+  }, [size, angle, stabilizer, taper, straight, mode])
 
   const stageRef = useRef<HTMLDivElement>(null)
   const bgRef = useRef<HTMLCanvasElement>(null)
@@ -224,8 +229,21 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
   useEffect(() => { redrawInk(glyph) }, [glyph, box, redrawInk])
 
   // ---------- Pointer drawing ----------
-  const live = useRef<{ stroke: Stroke; sx: number; sy: number } | null>(null)
+  interface Live {
+    stroke: Stroke
+    pens: number[] // raw pen pressure per point
+    sx: number // stabilised position
+    sy: number
+    dist: number // length drawn so far
+    t: number // timestamp of the last point
+    speedK: number // brush-pen width, eased
+    straight: boolean
+  }
+  const live = useRef<Live | null>(null)
   const dragImg = useRef<{ x: number; y: number; ix: number; iy: number } | null>(null)
+  const inkView = (): View => ({ x0: FRAME.left, y0: FRAME.top, scale: inkRef.current!.height / FRAME_H })
+  const penOf = (ev: PointerEvent | React.PointerEvent) => (ev.pointerType === 'pen' ? Math.max(0.05, ev.pressure) : 1)
+  const r1 = (n: number) => Math.round(n * 10) / 10
 
   const onDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return
@@ -235,11 +253,11 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
       if (glyph.image) dragImg.current = { x: p.x, y: p.y, ix: glyph.image.x, iy: glyph.image.y }
       return
     }
-    const pr = e.pointerType === 'pen' ? Math.max(0.05, e.pressure) : 1
-    const stroke: Stroke = { tool: mode, size, angle, pts: [Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10, pr] }
-    live.current = { stroke, sx: p.x, sy: p.y }
-    const ctx = inkRef.current!.getContext('2d')!
-    drawSegment(ctx, stroke, 0, { x0: FRAME.left, y0: FRAME.top, scale: inkRef.current!.height / FRAME_H }, cssVar('--ink'))
+    const pen = penOf(e)
+    const first = mode === 'taper' ? taperAt(0, taperLength(size, taper)) * pen : mode === 'speed' ? 0.7 * pen : pen
+    const stroke: Stroke = { tool: mode, size, angle, pts: [r1(p.x), r1(p.y), taper > 0 || mode !== 'taper' ? first : pen] }
+    live.current = { stroke, pens: [pen], sx: p.x, sy: p.y, dist: 0, t: e.timeStamp, speedK: 0.7, straight: straight || e.shiftKey }
+    drawSegment(inkRef.current!.getContext('2d')!, stroke, 0, inkView(), cssVar('--ink'))
   }
 
   const onMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -252,9 +270,26 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
     }
     const l = live.current
     if (!l) return
-    const events = e.nativeEvent.getCoalescedEvents?.() ?? [e.nativeEvent]
     const ctx = inkRef.current!.getContext('2d')!
-    const v = { x0: FRAME.left, y0: FRAME.top, scale: inkRef.current!.height / FRAME_H }
+    const v = inkView()
+
+    if (l.straight || e.shiftKey) {
+      // Straight line: rubber-band from the start point; Shift snaps to 15°.
+      l.straight = true
+      const p = toUnits(e)
+      const [x0, y0] = l.stroke.pts
+      const [x1, y1] = e.shiftKey ? snapAngle(x0, y0, p.x, p.y) : [p.x, p.y]
+      const pen = penOf(e)
+      l.stroke.pts = [l.stroke.pts[0], l.stroke.pts[1], pen, r1(x1), r1(y1), pen]
+      l.pens = [pen, pen]
+      const shown = finishStroke(resampleLine(l.stroke, pen), taper, [])
+      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height)
+      drawGlyph(ctx, glyph, v, cssVar('--ink'))
+      drawStroke(ctx, shown, v, cssVar('--ink'))
+      return
+    }
+
+    const events = e.nativeEvent.getCoalescedEvents?.() ?? [e.nativeEvent]
     for (const ev of events) {
       const p = toUnits(ev)
       // Stabilizer: the pen trails the pointer a little, smoothing out jitter.
@@ -263,9 +298,20 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
       l.sy += (p.y - l.sy) * k
       const pts = l.stroke.pts
       const lx = pts[pts.length - 3], ly = pts[pts.length - 2]
-      if (Math.hypot(l.sx - lx, l.sy - ly) < 2) continue
-      const pr = ev.pointerType === 'pen' ? Math.max(0.05, ev.pressure) : 1
-      pts.push(Math.round(l.sx * 10) / 10, Math.round(l.sy * 10) / 10, pr)
+      const step = Math.hypot(l.sx - lx, l.sy - ly)
+      if (step < 2) continue
+      const pen = penOf(ev)
+      l.dist += step
+      let w = pen
+      if (mode === 'taper' && taper > 0) w = taperAt(l.dist, taperLength(size, taper)) * pen
+      if (mode === 'speed') {
+        const dt = Math.max(1, ev.timeStamp - l.t)
+        l.speedK += (speedTarget(step / dt) - l.speedK) * 0.25
+        w = l.speedK * pen
+      }
+      l.t = ev.timeStamp
+      pts.push(r1(l.sx), r1(l.sy), Math.round(w * 1000) / 1000)
+      l.pens.push(pen)
       drawSegment(ctx, l.stroke, pts.length / 3 - 1, v, cssVar('--ink'))
     }
   }
@@ -281,7 +327,13 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
     const l = live.current
     live.current = null
     if (!l) return
-    commit({ ...glyph, strokes: [...glyph.strokes, l.stroke] })
+    let stroke = l.stroke
+    let pens = l.pens
+    if (l.straight) {
+      stroke = resampleLine(stroke, l.pens[0])
+      pens = []
+    }
+    commit({ ...glyph, strokes: [...glyph.strokes, finishStroke(stroke, taper, pens)] })
   }
 
   // ---------- Picture tracing ----------
@@ -323,9 +375,8 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
       else if (e.key === 'Escape') onClose()
       else if (e.key === 'ArrowRight') onNavigate(next.cp)
       else if (e.key === 'ArrowLeft') onNavigate(prev.cp)
-      else if (e.key === 'b') setMode('brush')
-      else if (e.key === 'n') setMode('nib')
-      else if (e.key === 'e') setMode('eraser')
+      else if (e.key === 'l') setStraight((v) => !v)
+      else if (!mod && BRUSHES.some((b) => b.key === e.key)) setMode(BRUSHES.find((b) => b.key === e.key)!.id)
       else if (e.key === '[') setSize((s) => Math.max(8, s - 6))
       else if (e.key === ']') setSize((s) => Math.min(200, s + 6))
     }
@@ -361,12 +412,17 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
           <div>
             <h4>Tool</h4>
             <div className="tools">
-              <button className={`btn ${mode === 'brush' ? 'on' : ''}`} onClick={() => setMode('brush')} title="Round brush (B)">{Icons.brush}Brush</button>
-              <button className={`btn ${mode === 'nib' ? 'on' : ''}`} onClick={() => setMode('nib')} title="Calligraphy nib (N)">{Icons.nib}Nib</button>
-              <button className={`btn ${mode === 'eraser' ? 'on' : ''}`} onClick={() => setMode('eraser')} title="Eraser (E)">{Icons.eraser}Eraser</button>
-              <button className={`btn ${mode === 'move' ? 'on' : ''}`} onClick={() => setMode('move')} disabled={!glyph.image} title="Move the picture">{Icons.move}Move pic</button>
+              {BRUSHES.map((b) => (
+                <button key={b.id} className={`btn ${mode === b.id ? 'on' : ''}`} onClick={() => setMode(b.id)}
+                  title={`${b.hint} (${b.key.toUpperCase()})`} aria-pressed={mode === b.id}>
+                  {Icons[b.id]}{b.label}
+                </button>
+              ))}
+              <button className={`btn ${mode === 'move' ? 'on' : ''}`} onClick={() => setMode('move')} disabled={!glyph.image} title="Move the traced picture" aria-pressed={mode === 'move'}>{Icons.move}Move pic</button>
             </div>
+            <p className="muted small" style={{ margin: '8px 0 0' }}>{mode === 'move' ? 'Drag the traced picture into place.' : BRUSHES.find((b) => b.id === mode)?.hint}</p>
           </div>
+          {mode !== 'move' && <BrushPreview tool={mode} size={size} angle={angle} taper={taper} straight={straight} />}
           <div>
             <div className="slider-row"><span>Size</span><b>{size}</b></div>
             <input type="range" min={8} max={200} value={size} onChange={(e) => setSize(+e.target.value)} aria-label="Pen size" />
@@ -377,6 +433,15 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
               <input type="range" min={0} max={180} value={angle} onChange={(e) => setAngle(+e.target.value)} aria-label="Nib angle" />
             </div>
           )}
+          {mode === 'taper' && (
+            <div>
+              <div className="slider-row"><span>Taper</span><b>{Math.round(taper * 100)}%</b></div>
+              <input type="range" min={0} max={1} step={0.05} value={taper} onChange={(e) => setTaper(+e.target.value)} aria-label="Taper amount" />
+            </div>
+          )}
+          <label className="check" title="Draw straight lines (L). Hold Shift while drawing to snap to 15° angles.">
+            <input type="checkbox" checked={straight} onChange={(e) => setStraight(e.target.checked)} />Straight lines
+          </label>
           <div>
             <div className="slider-row"><span>Steady hand</span><b>{Math.round(stabilizer * 100)}%</b></div>
             <input type="range" min={0} max={0.9} step={0.05} value={stabilizer} onChange={(e) => setStabilizer(+e.target.value)} aria-label="Stabilizer" />
@@ -450,11 +515,37 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
               {mark
                 ? <><li>Draw the fili where it should sit on the faint <span className="thaana">ބ</span>. It will sit the same way on every letter.</li><li>Draw your own <span className="thaana">ބ</span> first for the best fit.</li></>
                 : <><li>Sit the letter on the baseline and keep its body near the letter-height line.</li><li>Where you draw left or right doesn’t matter; spacing is automatic.</li></>}
-              <li>Shortcuts: <span className="kbd">B</span> <span className="kbd">N</span> <span className="kbd">E</span> tools, <span className="kbd">[</span> <span className="kbd">]</span> size, <span className="kbd">←</span> <span className="kbd">→</span> letters.</li>
+              <li>Shortcuts: <span className="kbd">B</span> <span className="kbd">P</span> <span className="kbd">R</span> <span className="kbd">M</span> <span className="kbd">N</span> <span className="kbd">E</span> tools, <span className="kbd">L</span> straight lines (hold <span className="kbd">Shift</span> to snap), <span className="kbd">[</span> <span className="kbd">]</span> size, <span className="kbd">←</span> <span className="kbd">→</span> letters.</li>
             </ul>
           </div>
         </aside>
       </div>
     </div>
   )
+}
+
+/** A sample S-curve drawn with the current brush settings. */
+function BrushPreview({ tool, size, angle, taper, straight }: { tool: Tool; size: number; angle: number; taper: number; straight: boolean }) {
+  const ref = useRef<HTMLCanvasElement>(null)
+  useEffect(() => {
+    const c = ref.current
+    if (!c) return
+    const ctx = c.getContext('2d')!
+    ctx.clearRect(0, 0, c.width, c.height)
+    // Sample path in a 1000 × 300 unit box; the brush-pen speeds up through the middle.
+    const pts: number[] = []
+    const n = 60
+    for (let i = 0; i <= n; i++) {
+      const t = i / n
+      const x = straight ? 120 + t * 760 : 120 + t * 760
+      const y = straight ? 60 + t * 180 : 150 + Math.sin(t * Math.PI * 2) * 85
+      const w = tool === 'speed' ? speedTarget(Math.sin(t * Math.PI) * 3.2) : 1
+      pts.push(x, y, w)
+    }
+    let stroke: Stroke = { tool: tool === 'eraser' ? 'brush' : tool, size, angle, pts }
+    stroke = finishStroke(stroke, taper, [])
+    const scale = c.width / 1000
+    drawStroke(ctx, stroke, { x0: 0, y0: 300, scale }, tool === 'eraser' ? cssVar('--muted') : cssVar('--ink'))
+  }, [tool, size, angle, taper, straight])
+  return <canvas ref={ref} width={376} height={113} className="brush-preview" aria-label="Brush preview" />
 }

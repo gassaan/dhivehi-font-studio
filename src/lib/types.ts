@@ -9,7 +9,18 @@ export const FRAME = { left: 0, right: 1000, top: 850, bottom: -350 }
 export const FRAME_W = FRAME.right - FRAME.left
 export const FRAME_H = FRAME.top - FRAME.bottom
 
-export type Tool = 'brush' | 'nib' | 'eraser'
+/**
+ * brush  – round, even line
+ * taper  – pointed pen: thin at both ends, full in the middle
+ * speed  – brush pen: thick when slow, thin when fast
+ * marker – square tip that does not rotate
+ * nib    – flat calligraphy nib held at an angle
+ * eraser – removes ink
+ */
+export type Tool = 'brush' | 'taper' | 'speed' | 'marker' | 'nib' | 'eraser'
+
+/** Brushes whose third point value is the final width factor (0–1), not raw pen pressure. */
+export const SHAPED_TOOLS: Tool[] = ['taper', 'speed']
 
 export interface Stroke {
   tool: Tool
