@@ -14,14 +14,14 @@ const SAMPLES = [
   'ބަ ބާ ބި ބީ ބު ބޫ ބެ ބޭ ބޮ ބޯ ބް',
 ]
 
-export default function Preview({ project, compiled }: { project: Project; compiled: Compiled | null }) {
+export default function Preview({ project, compiled, guideFont }: { project: Project; compiled: Compiled | null; guideFont: string }) {
   const [text, setText] = useState(SAMPLES[0] + '\n' + SAMPLES[3])
   const [size, setSize] = useState(64)
   const [phonetic, setPhonetic] = useState(true)
   const [shift, setShift] = useState(false)
   const ta = useRef<HTMLTextAreaElement>(null)
 
-  const family = compiled ? `"${compiled.family}", "Noto Sans Thaana", sans-serif` : '"Noto Sans Thaana", sans-serif'
+  const family = compiled ? `"${compiled.family}", ${guideFont}` : guideFont
 
   const insert = (s: string) => {
     const el = ta.current
@@ -108,7 +108,7 @@ export default function Preview({ project, compiled }: { project: Project; compi
           {missing.length === 0
             ? <p className="muted small" style={{ margin: 0 }}>Every letter in your text is from your font.</p>
             : <>
-                <p className="muted small" style={{ margin: 0 }}>These appear in a standard font for now. Tap one to draw it.</p>
+                <p className="muted small" style={{ margin: 0 }}>These show in your guide font for now. Tap one to draw it.</p>
                 <div className="missing">
                   {missing.map((cp) => (
                     <button key={cp} title={CHAR_BY_CP.get(cp)?.name} onClick={() => go(`/font/${project.id}/glyph/${cp.toString(16)}`)}>

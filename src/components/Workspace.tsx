@@ -3,6 +3,7 @@ import { go, type Route } from '../App.tsx'
 import { compileProject } from '../lib/compile.ts'
 import { getProject, saveProject } from '../lib/db.ts'
 import { loadFont } from '../lib/fontface.ts'
+import { useGuideFont } from '../lib/guidefont.ts'
 import type { Project } from '../lib/types.ts'
 import ExportPanel from './ExportPanel.tsx'
 import GlyphEditor from './GlyphEditor.tsx'
@@ -41,6 +42,9 @@ function useCompiled(project: Project | null): Compiled | null {
   }, [project])
   return compiled
 }
+
+// Stand-in so the guide-font hook can run before the project has loaded.
+const EMPTY = { id: '', glyphs: {} } as unknown as Project
 
 const TABS = [
   { id: 'draw', label: 'Draw' },
@@ -85,6 +89,7 @@ export default function Workspace({ route }: { route: Extract<Route, { page: 'fo
   }, [flush])
 
   const compiled = useCompiled(project)
+  const guideFont = useGuideFont(project ?? EMPTY)
 
   if (missing) {
     return (
@@ -117,12 +122,13 @@ export default function Workspace({ route }: { route: Extract<Route, { page: 'fo
       </header>
       <main className="ws-body">
         {route.tab === 'draw' && <GlyphGrid project={project} onOpen={(cp) => go(`${base}/glyph/${cp.toString(16)}`)} />}
-        {route.tab === 'test' && <Preview project={project} compiled={compiled} />}
+        {route.tab === 'test' && <Preview project={project} compiled={compiled} guideFont={guideFont} />}
         {route.tab === 'download' && <ExportPanel project={project} update={update} compiled={compiled} toast={showToast} />}
         {route.tab === 'settings' && <SettingsPanel project={project} update={update} />}
       </main>
       {route.glyph !== undefined && (
         <GlyphEditor
+          guideFont={guideFont}
           key={route.glyph}
           project={project}
           cp={route.glyph}

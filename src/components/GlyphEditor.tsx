@@ -4,6 +4,7 @@ import { traceGlyph } from '../lib/compile.ts'
 import { BRUSHES, STEADY_PRESETS, finishStroke, resampleLine, sizeToSlider, sliderToSize, smoothStroke, snapAngle, speedTarget, taperAt, taperLength, type Steady } from '../lib/brushes.ts'
 import { drawGlyph, drawSegment, drawStroke, imageToMask, preloadGlyph, type View } from '../lib/ink.ts'
 import { DETAIL_LEVELS, FRAME, FRAME_H, FRAME_W, emptyGlyph, hasInk, type GlyphData, type Project, type Stroke, type Tool } from '../lib/types.ts'
+import GuideFontPicker from './GuideFontPicker.tsx'
 import { Icons, cssVar } from './ui.tsx'
 import type { Contour } from '../lib/trace.ts'
 import type { Compiled, Update } from './Workspace.tsx'
@@ -17,9 +18,10 @@ interface Props {
   compiled: Compiled | null
   onNavigate: (cp: number) => void
   onClose: () => void
+  /** CSS font stack for the faint reference letters. */
+  guideFont: string
 }
 
-const REF_FONT = '"Noto Sans Thaana", "MV Boli", sans-serif'
 const prefKey = 'dvfs-pen'
 
 const PREF_DEFAULTS = {
@@ -38,7 +40,8 @@ function loadPrefs() {
   }
 }
 
-export default function GlyphEditor({ project, cp, update, compiled, onNavigate, onClose }: Props) {
+export default function GlyphEditor({ project, cp, update, compiled, onNavigate, onClose, guideFont }: Props) {
+  const REF_FONT = guideFont
   const info = CHAR_BY_CP.get(cp) ?? CHARS[0]
   const mark = isMark(info.kind)
   const settings = project.settings
@@ -192,8 +195,12 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
       const center = (FRAME.left + FRAME.right) / 2
       // Reference letter from a standard Thaana font, scaled to the letter height.
       ctx.font = `100px ${REF_FONT}`
+      // Fit the guide font's baa between the baseline and the letter-height line,
+      // whatever its own proportions (some fonts dip below the baseline).
       const m = ctx.measureText('ބ')
-      const k = m.actualBoundingBoxAscent > 0 ? lh / m.actualBoundingBoxAscent : 4
+      const body = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent
+      const k = body > 0 ? lh / body : 4
+      const refBase = m.actualBoundingBoxDescent * k // units to raise the text baseline
       const fontPx = 100 * k * view.scale
       ctx.font = `${fontPx}px ${REF_FONT}`
       ctx.textBaseline = 'alphabetic'
@@ -226,17 +233,17 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
           const c2 = t2.getContext('2d')!
           c2.font = ctx.font
           c2.fillStyle = cssVar('--muted')
-          c2.fillText('ބ' + info.char, x, Y(0))
+          c2.fillText('ބ' + info.char, x, Y(refBase))
           c2.globalCompositeOperation = 'destination-out'
-          c2.fillText('ބ', x, Y(0))
+          c2.fillText('ބ', x, Y(refBase))
           c2.lineWidth = 3 * pxr // also remove the anti-aliased fringe
-          c2.strokeText('ބ', x, Y(0))
+          c2.strokeText('ބ', x, Y(refBase))
           ctx.globalAlpha = 0.3
           ctx.drawImage(t2, 0, 0)
           ctx.globalAlpha = 1
         } else {
           ctx.fillStyle = ghost
-          ctx.fillText(mark ? 'ބ' + info.char : info.char, x, Y(0))
+          ctx.fillText(mark ? 'ބ' + info.char : info.char, x, Y(refBase))
         }
       }
 
@@ -284,7 +291,7 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
     }
     draw()
     return () => { live = false }
-  }, [canvasW, canvasH, pxr, zoom, showGrid, showRef, mark, info.char, guide, guideCenter, settings.letterHeight]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [REF_FONT, canvasW, canvasH, pxr, zoom, showGrid, showRef, mark, info.char, guide, guideCenter, settings.letterHeight]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------- Ink layer ----------
   const redrawInk = useCallback(async (g: GlyphData) => {
@@ -697,6 +704,10 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
           </div>
           <div className="stack" style={{ gap: 8 }}>
             <label className="check"><input type="checkbox" checked={showRef} onChange={(e) => setShowRef(e.target.checked)} />Show reference letter</label>
+            <details className="guide-details">
+              <summary>Guide font</summary>
+              <GuideFontPicker project={project} update={update} compact />
+            </details>
             <label className="check" title="G"><input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} />Show grid</label>
             <button className="btn small danger" disabled={!hasInk(glyph)} onClick={() => commit({ ...emptyGlyph(), lsbAdjust: glyph.lsbAdjust, rsbAdjust: glyph.rsbAdjust })}>{Icons.trash} Clear</button>
           </div>
@@ -749,7 +760,7 @@ export default function GlyphEditor({ project, cp, update, compiled, onNavigate,
             {inFont && compiled
               ? <div className="strip" style={{ fontFamily: `"${compiled.family}", ${REF_FONT}` }}>{sample}</div>
               : <div className="strip wait">{hasInk(glyph) ? 'Updating…' : 'Draw something and it appears here, set in your font.'}</div>}
-            <p className="muted small" style={{ margin: '6px 0 0' }}>Letters you haven’t drawn yet show in a standard font.</p>
+            <p className="muted small" style={{ margin: '6px 0 0' }}>Letters you haven’t drawn yet show in your guide font.</p>
           </div>
           <div>
             <h4>Outline detail</h4>

@@ -80,6 +80,8 @@ export interface Project {
   updatedAt: number
   settings: FontSettings
   glyphs: Record<number, GlyphData>
+  /** Optional font the faint reference letters are drawn in. Kept in this browser only. */
+  guideFont?: { name: string; data: ArrayBuffer; addedAt: number }
 }
 
 export const DEFAULT_SETTINGS: FontSettings = {

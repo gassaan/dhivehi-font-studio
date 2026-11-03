@@ -100,7 +100,7 @@ export default function ExportPanel({ project, update, compiled, toast }: Props)
         <div className="card panel stack">
           <h3>Backup</h3>
           <p className="muted small" style={{ margin: 0 }}>Fonts are saved in this browser. Download a backup file to keep your drawings safe or continue on another device (import it from the home page).</p>
-          <button className="btn small" style={{ alignSelf: 'start' }} onClick={() => download(JSON.stringify(project), `${slug}.dhivehi-font.json`, 'application/json')}>
+          <button className="btn small" style={{ alignSelf: 'start' }} onClick={() => download(JSON.stringify({ ...project, guideFont: undefined }), `${slug}.dhivehi-font.json`, 'application/json')}>
             {Icons.download} Download backup
           </button>
         </div>

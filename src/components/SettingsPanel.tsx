@@ -1,6 +1,7 @@
 import { go } from '../App.tsx'
 import { deleteProject } from '../lib/db.ts'
 import { DETAIL_LEVELS, type FontSettings, type Project } from '../lib/types.ts'
+import GuideFontPicker from './GuideFontPicker.tsx'
 import type { Update } from './Workspace.tsx'
 
 const SLIDERS: { key: Exclude<keyof FontSettings, 'detail'>; label: string; hint: string; min: number; max: number; step: number }[] = [
@@ -35,14 +36,20 @@ export default function SettingsPanel({ project, update }: { project: Project; u
           </div>
         ))}
       </div>
-      <div className="card panel stack">
-        <h3>Danger zone</h3>
-        <p className="muted small" style={{ margin: 0 }}>Deleting removes this font and all its drawings from this browser. Download a backup first if you might want it back.</p>
-        <button className="btn danger" style={{ alignSelf: 'start' }} onClick={async () => {
-          if (!confirm(`Delete “${project.name}” permanently?`)) return
-          await deleteProject(project.id)
-          go('/')
-        }}>Delete this font</button>
+      <div className="stack">
+        <div className="card panel stack">
+          <h3>Guide font</h3>
+          <GuideFontPicker project={project} update={update} />
+        </div>
+        <div className="card panel stack">
+          <h3>Danger zone</h3>
+          <p className="muted small" style={{ margin: 0 }}>Deleting removes this font and all its drawings from this browser. Download a backup first if you might want it back.</p>
+          <button className="btn danger" style={{ alignSelf: 'start' }} onClick={async () => {
+            if (!confirm(`Delete “${project.name}” permanently?`)) return
+            await deleteProject(project.id)
+            go('/')
+          }}>Delete this font</button>
+        </div>
       </div>
     </div>
   )

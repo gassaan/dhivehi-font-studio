@@ -31,6 +31,7 @@ Every push to `main` builds and deploys to GitHub Pages (`.github/workflows/depl
 - **Fine work**: zoom to 600% (Ctrl + scroll, `+` / `−`, Space + drag to pan), pens down to a 2-unit hairline on a fine-grained size slider, a grid, a brush-size cursor, an **Outline detail** setting (Standard / Fine / Extra fine), and **Show font outline**, which overlays the exact outline that goes into the font.
 - **Trace a photo** of handwriting: dark pixels become ink that can be moved, scaled and tidied with the eraser.
 - **Draw fili in context** against their own ބ. Fili are placed automatically on every letter with OpenType mark positioning, so they sit correctly in Word, browsers, phones and design apps.
+- **Guide font**: upload any .ttf / .otf / .woff (Settings, or "Guide font" in the editor) and the faint reference letters, the letter grid and the test fallback use it instead of Noto Sans Thaana. It is fitted between the baseline and letter-height guides. It is a drawing aid only: it stays in the browser, it is never copied into the exported font, and it is left out of backups.
 - **Test** with the built-in phonetic keyboard (h → ހ, a → ަ …), sample texts and a size waterfall, and see which letters are still missing.
 - **Download** TTF and WOFF, copy a ready `@font-face` snippet, and export/import a backup file to move between devices.
 
